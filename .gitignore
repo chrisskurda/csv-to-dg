@@ -12,3 +12,4 @@ config.toml
 
 # Ignore all files in directories
 temp/*
+filtered_exports/*
