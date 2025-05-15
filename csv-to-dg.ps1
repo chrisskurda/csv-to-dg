@@ -13,9 +13,17 @@ if (!(Test-Path $configPath)) {
     throw "Config file not found: $configPath"
 }
 $config = Get-Content $configPath -Raw | ConvertFrom-Json
+$dbPath = $config.database.path
+
+# Tracking Variables
+$scriptStartTime = Get-Date
+$failedLookups = @()
+$membersAdded = @()
+$membersRemoved = @()
+$exchangeChanges = @()
 
 function Ensure-DistributionGroup {
-    $group = Get-ADGroup -Filter "Name -eq '$($config.dist_group.name)'" -ErrorAction SilentlyContinue
+    $group = Get-ADGroup -Filter "Name -eq '$($config.dist_group.name)'" -Server $config.ad.domain_controller -Properties * -ErrorAction SilentlyContinue
     if (-not $group) {
         try {
             New-ADGroup `
@@ -25,10 +33,8 @@ function Ensure-DistributionGroup {
                 -Path $config.dist_group.ou_path `
                 -Server $config.ad.domain_controller `
                 -OtherAttributes @{ mail = $config.dist_group.email }
-
             Write-Log "Created distribution group: $($config.dist_group.name)"
-            $group = Get-ADGroup -Filter "Name -eq '$($config.dist_group.name)'" -Server $config.ad.domain_controller
-            Log-Change -action "add" -object_type "group" -target $group.DistinguishedName -attribute "mail" -old_value "" -new_value $config.dist_group.email
+            $group = Get-ADGroup -Filter "Name -eq '$($config.dist_group.name)'" -Server $config.ad.domain_controller -Properties *
         } catch {
             Write-Log "Failed to create group: $_"
             throw
@@ -38,46 +44,33 @@ function Ensure-DistributionGroup {
     }
 
     $exchangeProps = @{}
-    if ($config.exchange_settings.auth_orig) {
-        $exchangeProps["authOrig"] = $config.exchange_settings.auth_orig
-    }
-    if ($config.exchange_settings.unauth_orig) {
-        $exchangeProps["unauthOrig"] = $config.exchange_settings.unauth_orig
-    }
-    if ($config.exchange_settings.dl_mem_reject_perms) {
-        $exchangeProps["dLMemRejectPerms"] = $config.exchange_settings.dl_mem_reject_perms
-    }
-    if ($config.exchange_settings.dl_mem_submit_perms) {
-        $exchangeProps["dLMemSubmitPerms"] = $config.exchange_settings.dl_mem_submit_perms
-    }
-    if ($config.exchange_settings.require_auth -eq $true) {
-        $exchangeProps["msExchRequireAuthToSendTo"] = $true
-    }
-    if ($config.exchange_settings.hide_from_gal -eq $true) {
-        $exchangeProps["msExchHideFromAddressLists"] = $true
+    foreach ($key in @("authOrig", "unauthOrig", "dLMemRejectPerms", "dLMemSubmitPerms", "msExchRequireAuthToSendTo", "msExchHideFromAddressLists")) {
+        $desired = $null
+        switch ($key) {
+            "authOrig"                  { $desired = $config.exchange_settings.auth_orig }
+            "unauthOrig"               { $desired = $config.exchange_settings.unauth_orig }
+            "dLMemRejectPerms"         { $desired = $config.exchange_settings.dl_mem_reject_perms }
+            "dLMemSubmitPerms"         { $desired = $config.exchange_settings.dl_mem_submit_perms }
+            "msExchRequireAuthToSendTo" { $desired = $config.exchange_settings.require_auth }
+            "msExchHideFromAddressLists" { $desired = $config.exchange_settings.hide_from_gal }
+        }
+        if ($null -ne $desired) {
+            $current = $group.$key
+            $currentVal = if ($current -is [array]) { $current } else { @($current) }
+            $desiredVal = if ($desired -is [array]) { $desired } else { @($desired) }
+
+            if (-not (@($currentVal) -join "|" -eq @($desiredVal) -join "|")) {
+                $exchangeProps[$key] = $desired
+                $exchangeChanges += " - ${key}: '$currentVal' -> '$desiredVal'"
+            }
+        }
     }
 
     if ($exchangeProps.Count -gt 0) {
         Set-ADGroup -Identity $group.DistinguishedName -Replace $exchangeProps
-        foreach ($key in $exchangeProps.Keys) {
-            Log-Change -action "modify" -object_type "group" -target $group.DistinguishedName -attribute $key -old_value "" -new_value "$($exchangeProps[$key])"
-        }
-        Write-Log "Applied Exchange settings to group: $($config.dist_group.name)"
-    }
-}
-
-function Send-EmailReport {
-    param ([string]$body)
-    if ($config.email.enabled) {
-        if (-not $config.email.smtp_server) {
-            throw "SMTP server not specified in config."
-        }
-        Send-MailMessage `
-            -From $config.email.from `
-            -To $config.email.to `
-            -Subject $config.email.subject `
-            -Body $body `
-            -SmtpServer $config.email.smtp_server
+        Write-Log "Updated Exchange settings for group: $($config.dist_group.name)"
+    } else {
+        Write-Log "No Exchange settings needed update."
     }
 }
 
@@ -89,50 +82,26 @@ function Write-Log {
     return "$timestamp - $message"
 }
 
-function Log-Change {
+function Send-EmailReport {
     param (
-        [string]$action,
-        [string]$object_type,
-        [string]$target,
-        [string]$attribute,
-        [string]$old_value,
-        [string]$new_value
+        [string]$body,
+        [string[]]$attachments = @()
     )
-    if ($config.use_database) {
-        $query = "INSERT INTO changes (timestamp, action, object_type, target, attribute, old_value, new_value) VALUES (@ts, @act, @obj, @tgt, @attr, @old, @new);"
+
+    if ($config.email.enabled) {
         $params = @{
-            ts   = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-            act  = $action
-            obj  = $object_type
-            tgt  = $target
-            attr = $attribute
-            old  = $old_value
-            new  = $new_value
+            From       = $config.email.from
+            To         = $config.email.to
+            Subject    = $config.email.subject
+            Body       = $body
+            SmtpServer = $config.email.smtp_server
         }
-        Invoke-SqliteQuery -DataSource $dbPath -Query $query -SqlParameters $params
-    }
-}
 
-function List-RollbackDates {
-    $results = Invoke-SqliteQuery -DataSource $dbPath -Query "SELECT DISTINCT date FROM imports ORDER BY date DESC;"
-    Write-Host "Available rollback dates:" -ForegroundColor Cyan
-    foreach ($row in $results) {
-        Write-Host " - $($row.date)"
-    }
-}
+        if ($attachments.Count -gt 0) {
+            $params["Attachments"] = $attachments
+        }
 
-function Show-ChangesForDate {
-    param ([string]$dateStr)
-    $results = Invoke-SqliteQuery -DataSource $dbPath -Query @"
-        SELECT * FROM changes WHERE substr(timestamp, 1, 10) = @date ORDER BY timestamp;
-"@ -SqlParameters @{ date = $dateStr }
-    if (!$results) {
-        Write-Host "No changes recorded for $dateStr." -ForegroundColor Yellow
-        return
-    }
-    Write-Host "Changes for ${dateStr}:" -ForegroundColor Cyan
-    foreach ($change in $results) {
-        Write-Host "$($change.timestamp) [$($change.action)] $($change.object_type) $($change.target) : $($change.attribute) = '$($change.old_value)' -> '$($change.new_value)'"
+        Send-MailMessage @params
     }
 }
 
@@ -148,6 +117,49 @@ function Reduce-CSV {
     return $reduced
 }
 
+function Cleanup-OldFiles {
+    $retention = $config.retention_days
+    Get-ChildItem -Path $config.paths.output_dir -Filter "filtered-HR-export-*.csv" | 
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$retention) } | 
+        Remove-Item -Force
+}
+
+function Update-GroupMembership {
+    param ([string]$csvPath)
+    $csv = Import-Csv $csvPath
+    $group = Get-ADGroup -Filter "Name -eq '$($config.dist_group.name)'" -Server $config.ad.domain_controller
+    $existingMembers = Get-ADGroupMember -Identity $group.DistinguishedName | Select-Object -ExpandProperty DistinguishedName
+
+    $targetMembers = $csv | ForEach-Object {
+        $email = $_."E-Mail".Trim()
+        if (![string]::IsNullOrWhiteSpace($email)) {
+            $safeEmail = $email -replace "'", "''"
+            try {
+                $user = Get-ADUser -Filter "mail -eq '$safeEmail'" -Server $config.ad.domain_controller -ErrorAction Stop
+                if ($user) { return $user.DistinguishedName }
+            } catch {
+                $logMessage = "Could not find AD user with email '$email'"
+                $failedLookups += $logMessage
+                Write-Log $logMessage | Out-Null
+            }
+        }
+    } | Where-Object { $_ -ne $null } | Sort-Object -Unique
+
+    $toAdd = $targetMembers | Where-Object { $_ -notin $existingMembers }
+    $toRemove = $existingMembers | Where-Object { $_ -notin $targetMembers }
+
+    foreach ($dn in $toAdd) {
+        Add-ADGroupMember -Identity $group.DistinguishedName -Members $dn
+        $membersAdded += $dn
+        Write-Log "Added $dn to $($group.Name)"
+    }
+    foreach ($dn in $toRemove) {
+        Remove-ADGroupMember -Identity $group.DistinguishedName -Members $dn -Confirm:$false
+        $membersRemoved += $dn
+        Write-Log "Removed $dn from $($group.Name)"
+    }
+}
+
 function Get-RawCsvText {
     param ([System.Object[]]$csv)
     $stringWriter = New-Object System.IO.StringWriter
@@ -159,29 +171,24 @@ function Get-RawCsvText {
 
 function Rollback {
     param ([string]$dateStr)
-    $backup = Invoke-SqliteQuery -DataSource $dbPath -Query "SELECT raw_csv FROM imports WHERE date = @date ORDER BY id DESC LIMIT 1;" -SqlParameters @{ date = $dateStr }
-    if (!$backup -or !$backup[0].raw_csv) {
-        Write-Log "No backup data found for rollback date $dateStr"
+    $path = Join-Path $config.paths.output_dir "filtered-HR-export-$dateStr.csv"
+    if (!(Test-Path $path)) {
+        Write-Log "Rollback file not found for $dateStr"
         return
     }
-    $raw = $backup[0].raw_csv
-    $tempFile = Join-Path $env:TEMP "hr-restore-$dateStr.csv"
-    $raw | Out-File -FilePath $tempFile -Encoding UTF8
-    Write-Log "Rolling back using database snapshot from $dateStr"
-    Update-GroupMembership $tempFile
-    Remove-Item $tempFile -Force
+    Update-GroupMembership -csvPath $path
+    Write-Log "Rollback completed for $dateStr"
 }
 
-# --- Main Execution ---
+# Main
 try {
     if ($ListRollbackDates) {
-        List-RollbackDates
+        Get-ChildItem -Path $config.paths.output_dir -Filter "filtered-HR-export-*.csv" |
+            ForEach-Object { $_.BaseName -replace "^filtered-HR-export-", "" } | Sort-Object -Descending | ForEach-Object { Write-Host $_ }
     } elseif ($ShowChangesFor) {
-        Show-ChangesForDate -dateStr $ShowChangesFor
-    } elseif ($UndoChangeId -gt 0) {
-        Undo-Change -changeId $UndoChangeId
+        Rollback -dateStr $ShowChangesFor
     } elseif ($RollbackDate) {
-        Rollback $RollbackDate
+        Rollback -dateStr $RollbackDate
     } else {
         $timestamp = Get-Date -Format "yyyy-MM-dd"
         $filteredCsvPath = Join-Path $config.paths.output_dir "filtered-HR-export-$timestamp.csv"
@@ -191,40 +198,51 @@ try {
         $rawCsvText = Get-RawCsvText -csv $csvData
 
         Ensure-DistributionGroup
-        Update-GroupMembership $filteredCsvPath
+        Update-GroupMembership -csvPath $filteredCsvPath
         Cleanup-OldFiles
 
-        $status = "success"
-        $logSummary = "Processed $entryCount entries."
-        Send-EmailReport "HR sync completed successfully for $timestamp."
+        $csvInfo = Get-Item $config.paths.input_csv
+        $group = Get-ADGroup -Filter "Name -eq '$($config.dist_group.name)'" -Properties mail -Server $config.ad.domain_controller
+        $finalMembers = Get-ADGroupMember -Identity $group.DistinguishedName
+        $finalCount = $finalMembers.Count
 
-        if ($config.use_database) {
-            $insertQuery = "INSERT INTO imports (date, filename, entry_count, status, log, raw_csv) VALUES (@date, @file, @count, @status, @log, @raw);"
-            $parameters = @{
-                date    = $timestamp
-                file    = $filteredCsvPath
-                count   = $entryCount
-                status  = $status
-                log     = $logSummary
-                raw     = $rawCsvText
-            }
-            Invoke-SqliteQuery -DataSource $dbPath -Query $insertQuery -SqlParameters $parameters
+        $reportBody = @()
+        $reportBody += "HR Sync Report"
+        $reportBody += "-------------------------"
+        $reportBody += "Script Run Time:       $($scriptStartTime)"
+        $reportBody += "Input CSV:             $($csvInfo.FullName)"
+        $reportBody += "CSV Last Modified:     $($csvInfo.LastWriteTime)"
+        $reportBody += "Entries in CSV:        $entryCount"
+        $reportBody += ""
+        $reportBody += "Group Name:            $($group.Name)"
+        $reportBody += "Group Email:           $($group.mail)"
+        $reportBody += ""
+        if ($exchangeChanges.Count -gt 0) {
+            $reportBody += "Exchange Settings Updated:"
+            $reportBody += $exchangeChanges
+            $reportBody += ""
         }
+        $reportBody += "Members Added:         $($membersAdded.Count)"
+        $reportBody += "Members Removed:       $($membersRemoved.Count)"
+        $reportBody += "Group Member Count:    $finalCount"
+        $reportBody += ""
+        if ($failedLookups.Count -gt 0) {
+            $reportBody += "Failed Lookups:"
+            $reportBody += $failedLookups | ForEach-Object { " - $_" }
+        }
+        $reportBody += ""
+        $reportBody = $reportBody -join "`n"
+
+        $logPath = Join-Path $config.paths.log_dir "hr-sync-$timestamp.log"
+        $attachments = @()
+        if (Test-Path $logPath) { $attachments += $logPath }
+        if (Test-Path $filteredCsvPath) { $attachments += $filteredCsvPath }
+
+        Write-Log "HR sync completed successfully. $entryCount users processed."
+        Send-EmailReport -body $reportBody -attachments $attachments
     }
 } catch {
     $err = Write-Log "Error: $_"
-    Send-EmailReport "HR sync failed: $_"
-    if ($config.use_database -and $dbPath) {
-        $insertQuery = "INSERT INTO imports (date, filename, entry_count, status, log, raw_csv) VALUES (@date, @file, @count, @status, @log, @raw);"
-        $parameters = @{
-            date    = (Get-Date -Format "yyyy-MM-dd")
-            file    = "ERROR"
-            count   = 0
-            status  = "failure"
-            log     = $err
-            raw     = ""
-        }
-        Invoke-SqliteQuery -DataSource $dbPath -Query $insertQuery -SqlParameters $parameters
-    }
+    Send-EmailReport -body "HR sync failed: $_"
     throw
 }

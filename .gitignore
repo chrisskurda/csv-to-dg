@@ -1,0 +1,14 @@
+# Ignore all .logs
+*.log
+
+# Ignore all .env files
+env
+
+# Ignore config files
+config.json
+config.yaml
+config.ini
+config.toml
+
+# Ignore all files in directories
+temp/*
