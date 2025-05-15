@@ -207,7 +207,7 @@ try {
         $finalCount = $finalMembers.Count
 
         $reportBody = @()
-        $reportBody += "HR Sync Report"
+        $reportBody += "Dist List Sync Report"
         $reportBody += "-------------------------"
         $reportBody += "Script Run Time:       $($scriptStartTime)"
         $reportBody += "Input CSV:             $($csvInfo.FullName)"
